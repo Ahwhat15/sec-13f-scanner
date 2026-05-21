@@ -20,8 +20,9 @@ HEADERS      = {'User-Agent': 'SEC-13F-Scanner Ahwhat15 ahwhat15@gmail.com'}
 EFTS_URL     = 'https://efts.sec.gov/LATEST/search-index'
 EDGAR        = 'https://www.sec.gov'
 DATA         = 'https://data.sec.gov'
-MIN_AUM_K    = 1_000_000   # $1B expressed in $1000 units (SEC value field is in $1000s)
+MIN_AUM_K    = 1_000_000   # $1B expressed in $1000 units
 CET          = ZoneInfo('Europe/Paris')
+HEARTBEAT_INTERVAL = 3600  # log alive every 1 hour
 
 
 # ── Telegram ──────────────────────────────────────────────────────────────────
@@ -38,13 +39,11 @@ def _send(text: str) -> None:
 
 
 def send_telegram(text: str) -> None:
-    """Send, splitting into ≤4000-char chunks if needed."""
     max_len = 4000
     if len(text) <= max_len:
         _send(text)
         logger.info('Telegram sent (%d chars)', len(text))
         return
-
     lines, chunk = text.split('\n'), ''
     for line in lines:
         if len(chunk) + len(line) + 1 > max_len:
@@ -60,7 +59,6 @@ def send_telegram(text: str) -> None:
 # ── EDGAR data fetch ───────────────────────────────────────────────────────────
 
 def get_13f_filings(start_date: str, end_date: str) -> list[dict]:
-    """Return deduplicated 13F-HR filing stubs from EFTS."""
     filings: list[dict] = []
     seen_acc: set[str]  = set()
     from_offset = 0
@@ -107,16 +105,13 @@ def get_13f_filings(start_date: str, end_date: str) -> list[dict]:
 
 
 def cik_from_path(filing_id: str) -> str:
-    """Extract CIK from the EFTS _id path (/Archives/edgar/data/{cik}/...)."""
     parts = filing_id.strip('/').split('/')
-    # parts: ['Archives','edgar','data','{cik}', ...]
     if len(parts) > 3 and parts[3].isdigit():
         return parts[3]
     return ''
 
 
 def find_info_table_url(filing_id: str) -> str | None:
-    """Locate the information-table XML inside a 13F filing directory."""
     dir_path = filing_id.rsplit('/', 1)[0] if '/' in filing_id else filing_id
     dir_url  = f'{EDGAR}{dir_path}/'
     try:
@@ -139,7 +134,6 @@ def find_info_table_url(filing_id: str) -> str | None:
 # ── Parsing ────────────────────────────────────────────────────────────────────
 
 def parse_holdings(xml_text: str) -> dict[str, dict]:
-    """Parse a 13F information table. Returns {key: {name, value_k, shares, put_call}}."""
     try:
         root = ET.fromstring(xml_text)
     except ET.ParseError as e:
@@ -188,7 +182,6 @@ def parse_holdings(xml_text: str) -> dict[str, dict]:
 
 
 def get_prev_holdings(cik: str, current_acc: str) -> dict[str, dict]:
-    """Fetch the previous quarter's 13F holdings via the submissions API."""
     try:
         r = requests.get(
             f'{DATA}/submissions/CIK{cik.zfill(10)}.json',
@@ -328,7 +321,6 @@ def run_scanner() -> None:
 
         cik = cik_from_path(filing['id'])
         if not cik:
-            # Fallback: first 10 digits of accession number
             cik = filing['accession_no'].replace('-', '')[:10].lstrip('0') or '0'
 
         previous = get_prev_holdings(cik, filing['accession_no'])
@@ -361,25 +353,45 @@ def run_scanner() -> None:
     logger.info('=== 13F scanner done ===')
 
 
-def next_run_seconds() -> float:
-    """Seconds until next Sunday 19:00 CET, accounting for DST."""
+# ── Scheduler ─────────────────────────────────────────────────────────────────
+
+def next_sunday_19h() -> datetime:
+    """Return the next Sunday 19:00 CET (always in the future)."""
     now = datetime.now(CET)
-    days_until_sunday = (6 - now.weekday()) % 7
-    target = (now + timedelta(days=days_until_sunday)).replace(
+    days_ahead = (6 - now.weekday()) % 7  # 0 = today is Sunday
+    candidate = (now + timedelta(days=days_ahead)).replace(
         hour=19, minute=0, second=0, microsecond=0
     )
-    if now >= target:
-        target += timedelta(days=7)
-    return (target - now).total_seconds()
+    # If we're already past this Sunday's 19:00 (or it's right now), push to next week
+    if candidate <= now:
+        candidate += timedelta(days=7)
+    return candidate
+
+
+def sleep_until(target: datetime) -> None:
+    """Sleep until target, logging a heartbeat every hour."""
+    while True:
+        now = datetime.now(CET)
+        remaining = (target - now).total_seconds()
+        if remaining <= 0:
+            return
+        logger.info(
+            '[heartbeat] 13F scanner alive | next run: %s CET (%.1fh away)',
+            target.strftime('%a %Y-%m-%d %H:%M'),
+            remaining / 3600,
+        )
+        # Sleep the smaller of 1 hour or time remaining
+        time.sleep(min(HEARTBEAT_INTERVAL, max(remaining, 1)))
 
 
 if __name__ == '__main__':
+    logger.info('13F scanner started — waiting for next scheduled run')
     while True:
+        target = next_sunday_19h()
+        sleep_until(target)
         try:
             run_scanner()
         except Exception as exc:
             logger.exception('Unhandled scanner error: %s', exc)
-
-        secs = next_run_seconds()
-        logger.info('Next run in %.1f hours (Sunday 19:00 CET)', secs / 3600)
-        time.sleep(secs)
+        # Brief pause to avoid re-triggering on the same second
+        time.sleep(60)
