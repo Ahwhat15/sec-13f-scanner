@@ -13,7 +13,7 @@ logger = logging.getLogger(__name__)
 
 SUPABASE_URL = os.environ["SUPABASE_URL"]
 SUPABASE_KEY = os.environ["SUPABASE_KEY"]
-RAILWAY_SERVICE_NAME = os.environ.get("RAILWAY_SERVICE_NAME", "unknown")
+RAILWAY_SERVICE_NAME = os.environ.get("VMC1_SERVICE_NAME") or os.environ.get("RAILWAY_SERVICE_NAME", "unknown")
 
 HEADERS = {
     "apikey": SUPABASE_KEY,
